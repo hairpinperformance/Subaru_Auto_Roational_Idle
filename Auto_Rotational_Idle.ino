@@ -1,27 +1,30 @@
 // === Pin assignments ===
-const int neutralPin   = A7;  // Analog read - HIGH = in neutral (via threshold)
+const int neutralPin   = A7;  // Analog read - HIGH = in neutral
 const int clutchPin    = 12;  // LOW = released
-const int feedbackPin  = 8;   // HIGH = defogger ON
+const int feedbackPin  = A3;  // Analog read - HIGH = defogger ON
 const int defrostOut   = 6;   // Arduino drives defogger switch
 
 // === Timing configuration ===
 const unsigned long pressDurationMs   = 1000;  // 1-second simulated press
 const unsigned long settleDelayMs     = 100;   // allow feedback to settle
-const unsigned long feedbackStableMs  = 100;   // feedback must be stable
 const unsigned long deactivateWindowMs = 4000; // 4-second window for 3 ON triggers
 const unsigned long manualLockoutMs   = 3000;  // 3-second ignore period after deactivation
 const unsigned long neutralHoldMs     = 3000;  // must stay in neutral this long before ON trigger
 const unsigned long clutchHoldMs      = 1500;  // must stay released this long before ON trigger
 
-// === Analog threshold for neutral detection ===
-const int neutralThreshold = 512; // ~2.5V for 5V Arduino (adjust if needed)
+// === Analog thresholds ===
+const int neutralThreshold  = 512; // ~2.5V threshold for neutral detection
+const int feedbackHighThreshold = 900;  // above this = definitely ON
+const int feedbackLowThreshold  = 100;  // below this = definitely OFF
+const unsigned long feedbackOffDelayMs = 1000;  // must stay low 1s before OFF
 
 // --- State variables ---
 bool systemActive = false;
 bool isPressing   = false;
 unsigned long pressStartMs       = 0;
-unsigned long feedbackChangeTime = 0;
-bool lastFeedback = false;
+unsigned long feedbackLowStart   = 0;
+bool feedbackState = false;  // smoothed/filtered ON/OFF
+bool lastFeedbackState = false;
 
 // --- Manual activate/deactivate tracking ---
 bool lastManualFeedback = false;
@@ -41,25 +44,67 @@ unsigned long clutchStartMs = 0;
 
 void setup() {
   pinMode(clutchPin, INPUT_PULLUP);
-  pinMode(feedbackPin, INPUT_PULLUP);
   pinMode(defrostOut, OUTPUT);
   digitalWrite(defrostOut, LOW);
 
   Serial.begin(9600);
-  Serial.println("Defogger control initialized - analog neutral input on A7");
+  Serial.println("Defogger control initialized");
 }
 
+// === Feedback update function ===
+void updateFeedbackState() {
+  int val = analogRead(feedbackPin);
+  unsigned long now = millis();
+
+  // If currently ON, look for a low condition
+  if (feedbackState) {
+    if (val < feedbackLowThreshold) {
+      if (feedbackLowStart == 0) {
+        feedbackLowStart = now;
+        Serial.print("Feedback low detected - starting OFF timer (v=");
+        Serial.print(val);
+        Serial.println(")");
+      } else if (now - feedbackLowStart >= feedbackOffDelayMs) {
+        feedbackState = false;
+        feedbackLowStart = 0;
+        Serial.println("Feedback OFF confirmed (stable low)");
+      }
+    } else {
+      if (feedbackLowStart > 0) {
+        Serial.println("Feedback spike -> cancel OFF timer, keep ON");
+        feedbackLowStart = 0;
+      }
+    }
+  } else {
+    if (val > feedbackHighThreshold) {
+      feedbackState = true;
+      Serial.println("Feedback ON detected (stable high)");
+    }
+  }
+
+  // Optional 1s debug print
+  static unsigned long lastPrint = 0;
+  if (now - lastPrint >= 1000) {
+    Serial.print("FeedbackRaw:"); Serial.print(val);
+    Serial.print(" FeedbackState:"); Serial.println(feedbackState ? "ON" : "OFF");
+    lastPrint = now;
+  }
+}
+
+// === Main loop ===
 void loop() {
   unsigned long now = millis();
 
-  // --- Read inputs ---
+  // --- Update feedback state ---
+  updateFeedbackState();
+
+  // --- Read other inputs ---
   int neutralValue = analogRead(neutralPin);
   bool neutralEngaged  = (neutralValue > neutralThreshold);
   bool clutchReleased  = (digitalRead(clutchPin) == LOW);
-  bool feedbackActive  = (digitalRead(feedbackPin) == HIGH); // TRUE = defogger ON
 
   // --- Detect manual defogger press to start system ---
-  if (!lastManualFeedback && feedbackActive) {
+  if (!lastManualFeedback && feedbackState) {
     if (now > ignoreManualUntil) {
       if (!systemActive) {
         systemActive = true;
@@ -69,14 +114,7 @@ void loop() {
       Serial.println("Manual press ignored (in lockout window)");
     }
   }
-  lastManualFeedback = feedbackActive;
-
-  // --- Debounce feedback ---
-  if (feedbackActive != lastFeedback) {
-    feedbackChangeTime = now;
-    lastFeedback = feedbackActive;
-  }
-  bool feedbackStable = (now - feedbackChangeTime) >= feedbackStableMs;
+  lastManualFeedback = feedbackState;
 
   // --- Track neutral hold time ---
   if (neutralEngaged) {
@@ -106,12 +144,12 @@ void loop() {
   bool triggerSwitch = false;
   bool isTriggerOn = false;
 
-  if (systemActive && !isPressing && feedbackStable) {
-    if (!feedbackActive && neutralHeldLongEnough && clutchHeldLongEnough) {
+  if (systemActive && !isPressing) {
+    if (!feedbackState && neutralHeldLongEnough && clutchHeldLongEnough) {
       triggerSwitch = true;
       isTriggerOn = true;
-      Serial.println("Trigger ON defogger (after 1.5s neutral + clutch hold)");
-    } else if (feedbackActive && (!neutralEngaged || !clutchReleased)) {
+      Serial.println("Trigger ON defogger (after neutral + clutch hold)");
+    } else if (feedbackState && (!neutralEngaged || !clutchReleased)) {
       triggerSwitch = true;
       isTriggerOn = false;
       Serial.println("Trigger OFF defogger");
@@ -130,10 +168,7 @@ void loop() {
     if (triggerOnCount >= 3) {
       systemActive = false;
       Serial.println("System DEACTIVATED - too many ON triggers within 4s");
-
-      // Prevent immediate reactivation
       ignoreManualUntil = now + manualLockoutMs;
-
       triggerOnCount = 0;
       firstTriggerOnTime = 0;
     }
@@ -146,14 +181,13 @@ void loop() {
     pressStartMs = now;
   }
 
-  // --- End press ---
+  // --- End simulated press ---
   if (isPressing && (now - pressStartMs >= pressDurationMs)) {
     digitalWrite(defrostOut, LOW);
     isPressing = false;
     delay(settleDelayMs);
-    feedbackActive = (digitalRead(feedbackPin) == HIGH);
     Serial.print("Feedback now: ");
-    Serial.println(feedbackActive ? "ON" : "OFF");
+    Serial.println(feedbackState ? "ON" : "OFF");
   }
 
   // --- Debug print ---
@@ -162,8 +196,7 @@ void loop() {
     Serial.print("NeutralVal:"); Serial.print(neutralValue);
     Serial.print(" NeutralEngaged:"); Serial.print(neutralEngaged);
     Serial.print(" ClutchReleased:"); Serial.print(clutchReleased);
-    Serial.print(" ClutchHeld:"); Serial.print(clutchHeldLongEnough);
-    Serial.print(" FeedbackActive:"); Serial.print(feedbackActive);
+    Serial.print(" FeedbackState:"); Serial.print(feedbackState ? "ON" : "OFF");
     Serial.print(" SystemActive:"); Serial.print(systemActive);
     Serial.print(" NeutralHeld:"); Serial.print(neutralHeldLongEnough);
     Serial.print(" ON_Count:"); Serial.println(triggerOnCount);
